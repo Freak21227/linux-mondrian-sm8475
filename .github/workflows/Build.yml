@@ -1,0 +1,191 @@
+name: Redmi K60 Kernel Builder
+
+on:
+workflow_dispatch:
+inputs:
+build_target:
+description: "What do you want to build?"
+required: true
+default: "all"
+type: choice
+options:
+- kernel
+- modules
+- dts
+- all
+
+env:
+ARCH: arm64
+DEFCONFIG: defconfig
+FRAGMENT_CONFIG: sm8450.config
+DTS_FILE: sm8475-redmi-k60.dts
+
+jobs:
+build:
+runs-on: ubuntu-22.04
+
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
+
+  - name: Install dependencies
+    run: |
+      sudo apt update
+
+      sudo apt install -y \
+        bc \
+        bison \
+        flex \
+        build-essential \
+        clang \
+        lld \
+        llvm \
+        gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
+        libssl-dev \
+        libelf-dev \
+        dwarves \
+        cpio \
+        rsync \
+        zip
+
+  - name: Setup output directories
+    run: |
+      mkdir -p out
+      mkdir -p artifacts
+
+  - name: Generate merged config
+    run: |
+      make O=out ${DEFCONFIG}
+
+      if [ -f "${FRAGMENT_CONFIG}" ]; then
+        ./scripts/kconfig/merge_config.sh \
+          -m \
+          -O out \
+          out/.config \
+          ${FRAGMENT_CONFIG}
+      fi
+
+      make O=out olddefconfig
+
+  #################################################################
+  # KERNEL
+  #################################################################
+
+  - name: Build Kernel
+    if: |
+      github.event.inputs.build_target == 'kernel' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      make -j$(nproc) \
+        O=out \
+        ARCH=arm64 \
+        CC=clang \
+        LLVM=1 \
+        Image
+
+  - name: Package Kernel
+    if: |
+      github.event.inputs.build_target == 'kernel' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      mkdir -p kernel_package
+
+      cp out/arch/arm64/boot/Image kernel_package/
+
+      cd kernel_package
+      zip -r ../artifacts/kernel.zip .
+
+  - name: Upload Kernel
+    if: |
+      github.event.inputs.build_target == 'kernel' ||
+      github.event.inputs.build_target == 'all'
+    uses: actions/upload-artifact@v4
+    with:
+      name: Kernel-Image
+      path: artifacts/kernel.zip
+
+  #################################################################
+  # MODULES
+  #################################################################
+
+  - name: Build Modules
+    if: |
+      github.event.inputs.build_target == 'modules' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      make -j$(nproc) \
+        O=out \
+        ARCH=arm64 \
+        CC=clang \
+        LLVM=1 \
+        modules
+
+  - name: Install Modules
+    if: |
+      github.event.inputs.build_target == 'modules' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      mkdir -p modules_install
+
+      make O=out \
+        ARCH=arm64 \
+        INSTALL_MOD_PATH=$PWD/modules_install \
+        modules_install
+
+  - name: Package Modules
+    if: |
+      github.event.inputs.build_target == 'modules' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      cd modules_install
+      zip -r ../artifacts/modules.zip .
+
+  - name: Upload Modules
+    if: |
+      github.event.inputs.build_target == 'modules' ||
+      github.event.inputs.build_target == 'all'
+    uses: actions/upload-artifact@v4
+    with:
+      name: Kernel-Modules
+      path: artifacts/modules.zip
+
+  #################################################################
+  # DTS / DTB
+  #################################################################
+
+  - name: Build DTS
+    if: |
+      github.event.inputs.build_target == 'dts' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      DTB_TARGET=$(basename ${DTS_FILE} .dts).dtb
+
+      make -j$(nproc) \
+        O=out \
+        ARCH=arm64 \
+        CC=clang \
+        LLVM=1 \
+        ${DTB_TARGET}
+
+  - name: Package DTS
+    if: |
+      github.event.inputs.build_target == 'dts' ||
+      github.event.inputs.build_target == 'all'
+    run: |
+      mkdir -p dts_package
+
+      find out -name "*.dtb" -exec cp {} dts_package/ \;
+      find out -name "*.dtbo" -exec cp {} dts_package/ \; || true
+
+      cd dts_package
+      zip -r ../artifacts/dts.zip .
+
+  - name: Upload DTS
+    if: |
+      github.event.inputs.build_target == 'dts' ||
+      github.event.inputs.build_target == 'all'
+    uses: actions/upload-artifact@v4
+    with:
+      name: DTS-DTB
+      path: artifacts/dts.zip
