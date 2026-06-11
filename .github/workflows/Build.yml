@@ -58,6 +58,7 @@ jobs:
             lld-${{ env.LLVM_VERSION }} \
             llvm-${{ env.LLVM_VERSION }} \
             libssl-dev libelf-dev \
+            llvm-${{ env.LLVM_VERSION }}-tools \
             dwarves cpio rsync zip
 
           # Quick sanity check — version must be 18.x
@@ -150,6 +151,9 @@ jobs:
       # ------------------------------------------------------------------ #
       #  Modules                                                             #
       # ------------------------------------------------------------------ #
+      # ------------------------------------------------------------------ #
+      #  Modules                                                             #
+      # ------------------------------------------------------------------ #
       - name: Build Modules
         if: >
           github.event.inputs.build_target == 'modules' ||
@@ -174,12 +178,16 @@ jobs:
             ARCH=${{ env.ARCH }} \
             INSTALL_MOD_PATH=$PWD/artifacts/modules \
             INSTALL_MOD_STRIP=1 \
+            STRIP="llvm-strip-${{ env.LLVM_VERSION }}" \
             modules_install
 
-          # Drop broken symlinks that point to runner-local paths
+          # Broken symlinks temizleme
           find artifacts/modules -type l \
             \( -name 'build' -o -name 'source' \) -delete
 
+          echo "Installed modules count:"
+          find artifacts/modules/lib/modules -name "*.ko" | wc -l
+          
       - name: Collect Modules
         if: >
           github.event.inputs.build_target == 'modules' ||
