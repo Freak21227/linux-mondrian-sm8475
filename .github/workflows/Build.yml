@@ -16,9 +16,9 @@ on:
 
 env:
   ARCH: arm64
-  DEFCONFIG: defconfig
-  FRAGMENT_CONFIG: sm8450.config
-  DTS_FILE: sm8475-redmi-k60.dts
+  DEFCONFIG: defconfig              # arch/arm64/configs/defconfig
+  FRAGMENT_CONFIG: sm8450.config    # optional fragment — skipped if not present
+  DTS_FILE: sm8475-redmi-k60        # without extension
 
 jobs:
   build:
@@ -27,112 +27,202 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ------------------------------------------------------------------ #
+      #  Dependencies                                                        #
+      # ------------------------------------------------------------------ #
+      # With LLVM=1, clang handles arm64 cross-compilation natively via
+      # --target=aarch64-linux-gnu. No GCC cross-compiler needed.
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-kernel-v1
+
       - name: Install deps
         run: |
           sudo apt update
           sudo apt install -y \
             bc bison flex build-essential \
             clang lld llvm \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
             libssl-dev libelf-dev \
             dwarves cpio rsync zip
 
+      # ------------------------------------------------------------------ #
+      #  Build cache                                                         #
+      # ------------------------------------------------------------------ #
+      - name: Cache build output
+        uses: actions/cache@v4
+        with:
+          path: out
+          key: >-
+            kernel-out-${{ runner.os }}-
+            ${{ hashFiles('Makefile', 'arch/arm64/configs/**', env.FRAGMENT_CONFIG) }}
+          restore-keys: |
+            kernel-out-${{ runner.os }}-
+
+      # ------------------------------------------------------------------ #
+      #  Config                                                              #
+      # ------------------------------------------------------------------ #
       - name: Prepare config
         run: |
           mkdir -p out
 
-          make O=out defconfig
+          make O=out \
+            ARCH=${{ env.ARCH }} \
+            CC=clang \
+            LLVM=1 \
+            ${{ env.DEFCONFIG }}
 
-          if [ -f sm8450.config ]; then
-            ./scripts/kconfig/merge_config.sh \
-              -m \
-              -O out \
-              out/.config \
-              sm8450.config
+          # Merge fragment if it exists
+          if [ -f "${{ env.FRAGMENT_CONFIG }}" ]; then
+            KCONFIG_CONFIG=out/.config \
+              ./scripts/kconfig/merge_config.sh \
+                -m \
+                out/.config \
+                ${{ env.FRAGMENT_CONFIG }}
           fi
 
-          make O=out olddefconfig
+          # Resolve any new symbols introduced by the fragment
+          make O=out \
+            ARCH=${{ env.ARCH }} \
+            CC=clang \
+            LLVM=1 \
+            olddefconfig
 
+          # Show a summary of what will be built
+          echo "---"
+          grep "^CONFIG_LOCALVERSION=" out/.config || true
+          echo "Kernel version: $(make O=out kernelversion 2>/dev/null)"
+          echo "---"
+
+      # ------------------------------------------------------------------ #
+      #  Kernel Image                                                        #
+      # ------------------------------------------------------------------ #
       - name: Build Image
-        if: github.event.inputs.build_target == 'kernel' || github.event.inputs.build_target == 'all'
+        if: >
+          github.event.inputs.build_target == 'kernel' ||
+          github.event.inputs.build_target == 'all'
         run: |
           make -j$(nproc) \
             O=out \
-            ARCH=arm64 \
+            ARCH=${{ env.ARCH }} \
             CC=clang \
             LLVM=1 \
             Image
 
-      - name: Zip Image
-        if: github.event.inputs.build_target == 'kernel' || github.event.inputs.build_target == 'all'
+      - name: Collect Image
+        if: >
+          github.event.inputs.build_target == 'kernel' ||
+          github.event.inputs.build_target == 'all'
         run: |
-          mkdir kernel
-          cp out/arch/arm64/boot/Image kernel/
-          cd kernel
-          zip -r ../kernel.zip .
+          mkdir -p artifacts/kernel
+          cp out/arch/arm64/boot/Image artifacts/kernel/
+          zip -r kernel.zip artifacts/kernel/
 
       - name: Upload Image
-        if: github.event.inputs.build_target == 'kernel' || github.event.inputs.build_target == 'all'
+        if: >
+          github.event.inputs.build_target == 'kernel' ||
+          github.event.inputs.build_target == 'all'
         uses: actions/upload-artifact@v4
         with:
           name: Kernel-Image
           path: kernel.zip
 
+      # ------------------------------------------------------------------ #
+      #  Modules                                                             #
+      # ------------------------------------------------------------------ #
       - name: Build Modules
-        if: github.event.inputs.build_target == 'modules' || github.event.inputs.build_target == 'all'
+        if: >
+          github.event.inputs.build_target == 'modules' ||
+          github.event.inputs.build_target == 'all'
         run: |
           make -j$(nproc) \
             O=out \
-            ARCH=arm64 \
+            ARCH=${{ env.ARCH }} \
             CC=clang \
             LLVM=1 \
             modules
 
       - name: Install Modules
-        if: github.event.inputs.build_target == 'modules' || github.event.inputs.build_target == 'all'
+        if: >
+          github.event.inputs.build_target == 'modules' ||
+          github.event.inputs.build_target == 'all'
         run: |
-          mkdir modules_install
+          mkdir -p artifacts/modules
 
           make O=out \
-            ARCH=arm64 \
-            INSTALL_MOD_PATH=$PWD/modules_install \
+            ARCH=${{ env.ARCH }} \
+            INSTALL_MOD_PATH=$PWD/artifacts/modules \
+            INSTALL_MOD_STRIP=1 \
             modules_install
 
-      - name: Zip Modules
-        if: github.event.inputs.build_target == 'modules' || github.event.inputs.build_target == 'all'
+          # Remove broken build/source symlinks — they point to
+          # the runner's local paths and are useless in the artifact
+          find artifacts/modules -type l \
+            \( -name 'build' -o -name 'source' \) -delete
+
+      - name: Collect Modules
+        if: >
+          github.event.inputs.build_target == 'modules' ||
+          github.event.inputs.build_target == 'all'
         run: |
-          cd modules_install
-          zip -r ../modules.zip .
+          zip -r modules.zip artifacts/modules/
 
       - name: Upload Modules
-        if: github.event.inputs.build_target == 'modules' || github.event.inputs.build_target == 'all'
+        if: >
+          github.event.inputs.build_target == 'modules' ||
+          github.event.inputs.build_target == 'all'
         uses: actions/upload-artifact@v4
         with:
           name: Kernel-Modules
           path: modules.zip
 
-      - name: Build DTB
-        if: github.event.inputs.build_target == 'dts' || github.event.inputs.build_target == 'all'
+      # ------------------------------------------------------------------ #
+      #  DTBs                                                                #
+      # ------------------------------------------------------------------ #
+      - name: Build DTBs
+        if: >
+          github.event.inputs.build_target == 'dts' ||
+          github.event.inputs.build_target == 'all'
         run: |
+          # 'dtbs' builds all device trees; we filter to the target below
           make -j$(nproc) \
             O=out \
-            ARCH=arm64 \
+            ARCH=${{ env.ARCH }} \
             CC=clang \
             LLVM=1 \
-            sm8475-redmi-k60.dtb
+            dtbs
 
-      - name: Zip DTB
-        if: github.event.inputs.build_target == 'dts' || github.event.inputs.build_target == 'all'
+      - name: Collect DTBs
+        if: >
+          github.event.inputs.build_target == 'dts' ||
+          github.event.inputs.build_target == 'all'
         run: |
-          mkdir dtb
-          find out -name "*.dtb" -exec cp {} dtb/ \;
-          find out -name "*.dtbo" -exec cp {} dtb/ \; || true
-          cd dtb
-          zip -r ../dtb.zip .
+          mkdir -p artifacts/dtb
+          DTB_DIR=out/arch/arm64/boot/dts
 
-      - name: Upload DTB
-        if: github.event.inputs.build_target == 'dts' || github.event.inputs.build_target == 'all'
+          # Try device-specific files first
+          find "$DTB_DIR" \
+            \( -name "${{ env.DTS_FILE }}.dtb" \
+            -o -name "${{ env.DTS_FILE }}.dtbo" \) \
+            -exec cp {} artifacts/dtb/ \; 2>/dev/null || true
+
+          # Fall back to everything if nothing matched
+          if [ -z "$(ls -A artifacts/dtb)" ]; then
+            echo "::warning::Device DTB not found — collecting all DTBs as fallback"
+            find "$DTB_DIR" -name "*.dtb"  -exec cp {} artifacts/dtb/ \;
+            find "$DTB_DIR" -name "*.dtbo" -exec cp {} artifacts/dtb/ \; || true
+          fi
+
+          echo "DTBs collected:"
+          ls -lh artifacts/dtb/
+
+          zip -r dtb.zip artifacts/dtb/
+
+      - name: Upload DTBs
+        if: >
+          github.event.inputs.build_target == 'dts' ||
+          github.event.inputs.build_target == 'all'
         uses: actions/upload-artifact@v4
         with:
           name: DTB
