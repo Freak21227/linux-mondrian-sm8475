@@ -16,9 +16,10 @@ on:
 
 env:
   ARCH: arm64
-  DEFCONFIG: defconfig              # arch/arm64/configs/defconfig
-  FRAGMENT_CONFIG: sm8450.config    # optional fragment — skipped if not present
-  DTS_FILE: sm8475-redmi-k60        # without extension
+  DEFCONFIG: defconfig
+  FRAGMENT_CONFIG: sm8450.config
+  DTS_FILE: sm8475-redmi-k60
+  LLVM_VERSION: 18          # bump here if your kernel needs 19+
 
 jobs:
   build:
@@ -28,24 +29,39 @@ jobs:
       - uses: actions/checkout@v4
 
       # ------------------------------------------------------------------ #
-      #  Dependencies                                                        #
+      #  Toolchain — LLVM 18 from apt.llvm.org                              #
       # ------------------------------------------------------------------ #
-      # With LLVM=1, clang handles arm64 cross-compilation natively via
-      # --target=aarch64-linux-gnu. No GCC cross-compiler needed.
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
           path: /var/cache/apt/archives
-          key: apt-${{ runner.os }}-kernel-v1
+          key: apt-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-v1
+
+      - name: Add LLVM ${{ env.LLVM_VERSION }} repository
+        run: |
+          wget -qO /tmp/llvm.gpg https://apt.llvm.org/llvm-snapshot.gpg.key
+          sudo gpg --dearmor < /tmp/llvm.gpg \
+            > /usr/share/keyrings/llvm-toolchain.gpg
+
+          echo \
+            "deb [signed-by=/usr/share/keyrings/llvm-toolchain.gpg] \
+            http://apt.llvm.org/jammy/ \
+            llvm-toolchain-jammy-${{ env.LLVM_VERSION }} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
 
       - name: Install deps
         run: |
           sudo apt update
           sudo apt install -y \
             bc bison flex build-essential \
-            clang lld llvm \
+            clang-${{ env.LLVM_VERSION }} \
+            lld-${{ env.LLVM_VERSION }} \
+            llvm-${{ env.LLVM_VERSION }} \
             libssl-dev libelf-dev \
             dwarves cpio rsync zip
+
+          # Quick sanity check — version must be 18.x
+          clang-${{ env.LLVM_VERSION }} --version
 
       # ------------------------------------------------------------------ #
       #  Build cache                                                         #
@@ -55,10 +71,10 @@ jobs:
         with:
           path: out
           key: >-
-            kernel-out-${{ runner.os }}-
+            kernel-out-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-
             ${{ hashFiles('Makefile', 'arch/arm64/configs/**', env.FRAGMENT_CONFIG) }}
           restore-keys: |
-            kernel-out-${{ runner.os }}-
+            kernel-out-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-
 
       # ------------------------------------------------------------------ #
       #  Config                                                              #
@@ -69,11 +85,12 @@ jobs:
 
           make O=out \
             ARCH=${{ env.ARCH }} \
-            CC=clang \
+            CC=clang-${{ env.LLVM_VERSION }} \
             LLVM=1 \
+            LLVM_SUFFIX=-${{ env.LLVM_VERSION }} \
             ${{ env.DEFCONFIG }}
 
-          # Merge fragment if it exists
+          # Merge optional fragment config
           if [ -f "${{ env.FRAGMENT_CONFIG }}" ]; then
             KCONFIG_CONFIG=out/.config \
               ./scripts/kconfig/merge_config.sh \
@@ -82,17 +99,18 @@ jobs:
                 ${{ env.FRAGMENT_CONFIG }}
           fi
 
-          # Resolve any new symbols introduced by the fragment
+          # Resolve any new symbols from the fragment
           make O=out \
             ARCH=${{ env.ARCH }} \
-            CC=clang \
+            CC=clang-${{ env.LLVM_VERSION }} \
             LLVM=1 \
+            LLVM_SUFFIX=-${{ env.LLVM_VERSION }} \
             olddefconfig
 
-          # Show a summary of what will be built
           echo "---"
-          grep "^CONFIG_LOCALVERSION=" out/.config || true
-          echo "Kernel version: $(make O=out kernelversion 2>/dev/null)"
+          echo "Kernel  : $(make O=out kernelversion 2>/dev/null)"
+          echo "Clang   : $(clang-${{ env.LLVM_VERSION }} --version | head -1)"
+          grep  "^CONFIG_LOCALVERSION=" out/.config || true
           echo "---"
 
       # ------------------------------------------------------------------ #
@@ -106,8 +124,9 @@ jobs:
           make -j$(nproc) \
             O=out \
             ARCH=${{ env.ARCH }} \
-            CC=clang \
+            CC=clang-${{ env.LLVM_VERSION }} \
             LLVM=1 \
+            LLVM_SUFFIX=-${{ env.LLVM_VERSION }} \
             Image
 
       - name: Collect Image
@@ -139,8 +158,9 @@ jobs:
           make -j$(nproc) \
             O=out \
             ARCH=${{ env.ARCH }} \
-            CC=clang \
+            CC=clang-${{ env.LLVM_VERSION }} \
             LLVM=1 \
+            LLVM_SUFFIX=-${{ env.LLVM_VERSION }} \
             modules
 
       - name: Install Modules
@@ -156,8 +176,7 @@ jobs:
             INSTALL_MOD_STRIP=1 \
             modules_install
 
-          # Remove broken build/source symlinks — they point to
-          # the runner's local paths and are useless in the artifact
+          # Drop broken symlinks that point to runner-local paths
           find artifacts/modules -type l \
             \( -name 'build' -o -name 'source' \) -delete
 
@@ -165,8 +184,7 @@ jobs:
         if: >
           github.event.inputs.build_target == 'modules' ||
           github.event.inputs.build_target == 'all'
-        run: |
-          zip -r modules.zip artifacts/modules/
+        run: zip -r modules.zip artifacts/modules/
 
       - name: Upload Modules
         if: >
@@ -185,12 +203,12 @@ jobs:
           github.event.inputs.build_target == 'dts' ||
           github.event.inputs.build_target == 'all'
         run: |
-          # 'dtbs' builds all device trees; we filter to the target below
           make -j$(nproc) \
             O=out \
             ARCH=${{ env.ARCH }} \
-            CC=clang \
+            CC=clang-${{ env.LLVM_VERSION }} \
             LLVM=1 \
+            LLVM_SUFFIX=-${{ env.LLVM_VERSION }} \
             dtbs
 
       - name: Collect DTBs
@@ -201,13 +219,13 @@ jobs:
           mkdir -p artifacts/dtb
           DTB_DIR=out/arch/arm64/boot/dts
 
-          # Try device-specific files first
+          # Target device first
           find "$DTB_DIR" \
             \( -name "${{ env.DTS_FILE }}.dtb" \
-            -o -name "${{ env.DTS_FILE }}.dtbo" \) \
+            -o  -name "${{ env.DTS_FILE }}.dtbo" \) \
             -exec cp {} artifacts/dtb/ \; 2>/dev/null || true
 
-          # Fall back to everything if nothing matched
+          # Fallback: everything
           if [ -z "$(ls -A artifacts/dtb)" ]; then
             echo "::warning::Device DTB not found — collecting all DTBs as fallback"
             find "$DTB_DIR" -name "*.dtb"  -exec cp {} artifacts/dtb/ \;
@@ -216,7 +234,6 @@ jobs:
 
           echo "DTBs collected:"
           ls -lh artifacts/dtb/
-
           zip -r dtb.zip artifacts/dtb/
 
       - name: Upload DTBs
